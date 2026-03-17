@@ -1,13 +1,15 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ==========================================
-// ⚙️ CONFIGURATION SENE-PAY (PRODUCTION)
+// Armazenamento em memória dos pagamentos completados (pode ser substituído por banco de dados)
+const completedPayments = {};
 // ==========================================
 const SENEPAY_CONFIG = {
     // Tes clés récupérées de ta capture d'écran
@@ -22,28 +24,41 @@ app.post('/api/initiate', async (req, res) => {
     console.log("\n=================================");
     console.log("📨 NOUVELLE DEMANDE DE PAIEMENT");
     
-    // Force 200 FCFA pour que ça passe en prod
-    const amount = req.body.amount < 200 ? 200 : req.body.amount;
+    const amount = req.body.amount || 1000;
+    const orderRef = "TICKET-" + Date.now();
     
-    // ASTUCE : On remplace 127.0.0.1 par localhost pour éviter l'erreur "Invalid return_url"
-    let returnUrl = req.body.returnUrl;
+    let returnUrl = req.body.returnUrl || "https://sinthioulive.pro/";
     if (returnUrl.includes('127.0.0.1')) {
         returnUrl = returnUrl.replace('127.0.0.1', 'localhost');
     }
 
     console.log(`👤 Client : ${req.body.customerName}`);
-    console.log(`💰 Montant : ${amount} FCFA`);
-    console.log(`↩️ URL Retour : ${returnUrl}`);
+    console.log(`💰 Montant : ${amount} XOF`);
+    console.log(`📦 Référence : ${orderRef}`);
 
     try {
-        const response = await axios.post(`${SENEPAY_CONFIG.baseUrl}/payments/initiate`, {
+        // Correct SenePay endpoint: /checkout/sessions
+        const senePayUrl = 'https://api.sene-pay.com/api/v1/checkout/sessions';
+        
+        const paymentRequest = {
             amount: amount,
             currency: "XOF",
-            orderId: "TICKET-" + Date.now(),
-            customerName: req.body.customerName,
-            customerPhone: req.body.customerPhone,
-            returnUrl: returnUrl // URL corrigée envoyée à SenePay
-        }, {
+            orderReference: orderRef,
+            description: `Ticket FootLocal - ${req.body.customerName}`,
+            successUrl: returnUrl,
+            cancelUrl: returnUrl,
+            webhookUrl: "https://footballfouta-backend.onrender.com/api/webhook/senepay",
+            metadata: {
+                customerName: req.body.customerName,
+                customerPhone: req.body.customerPhone,
+                customerEmail: req.body.customerEmail || ""
+            },
+            expiresInMinutes: 15
+        };
+
+        console.log("📤 Envoi à SenePay:", JSON.stringify(paymentRequest, null, 2));
+
+        const response = await axios.post(senePayUrl, paymentRequest, {
             headers: {
                 'Content-Type': 'application/json',
                 'X-Api-Key': SENEPAY_CONFIG.apiKey,
@@ -51,42 +66,182 @@ app.post('/api/initiate', async (req, res) => {
             }
         });
 
-        // Gestion robuste de la réponse (parfois dans data.data, parfois data)
-        const responseBody = response.data;
-        const actualData = responseBody.data || responseBody;
+        console.log("📦 Réponse brute SenePay:", response.data);
 
-        if (actualData && actualData.redirectUrl) {
-            console.log("✅ SUCCÈS ! Redirection vers :", actualData.redirectUrl);
-            res.json({ success: true, data: actualData });
+        const responseData = response.data;
+        const sessionToken = responseData.sessionToken || responseData.data?.sessionToken;
+        const checkoutUrl = responseData.checkoutUrl || responseData.data?.checkoutUrl;
+
+        if (checkoutUrl && sessionToken) {
+            console.log("✅ SUCCÈS !");
+            console.log("🔗 Lien paiement :", checkoutUrl);
+            console.log("🎫 Token session :", sessionToken);
+            
+            // Store payment in memory for webhook verification
+            completedPayments[sessionToken] = {
+                status: 'pending',
+                amount: amount,
+                orderReference: orderRef,
+                metadata: paymentRequest.metadata,
+                createdAt: new Date().toISOString()
+            };
+
+            res.json({ 
+                success: true, 
+                data: {
+                    redirectUrl: checkoutUrl,
+                    checkoutUrl: checkoutUrl,
+                    sessionToken: sessionToken
+                }
+            });
         } else {
-            console.log("⚠️ Réponse reçue mais lien manquant.");
-            res.status(500).json({ success: false, message: "Lien introuvable" });
+            console.log("⚠️ Réponse incomplète - missing URL ou token");
+            console.log("Response keys:", Object.keys(responseData));
+            res.status(500).json({ 
+                success: false, 
+                message: "Réponse SenePay incomplète",
+                received: responseData 
+            });
         }
 
     } catch (error) {
-        console.log("❌ ÉCHEC");
+        console.log("❌ ÉCHEC DE PAIEMENT");
         if (error.response) {
             console.log("🔴 Erreur API :", error.response.status);
             console.log("🔴 Message :", JSON.stringify(error.response.data, null, 2));
-            res.status(error.response.status).json(error.response.data);
+            res.status(error.response.status).json({ 
+                success: false,
+                error: error.response.data 
+            });
         } else {
             console.log("🔴 Erreur Réseau :", error.message);
-            res.status(500).json({ success: false, message: "Erreur de connexion" });
+            res.status(500).json({ 
+                success: false, 
+                message: "Erreur de connexion SenePay" 
+            });
         }
     }
 });
 
 app.get('/api/status/:token', async (req, res) => {
+    const token = req.params.token;
+    console.log("\n📋 VÉRIFICATION STATUT PAIEMENT");
+    console.log("🎫 Token :", token);
+    
     try {
-        const response = await axios.get(`${SENEPAY_CONFIG.baseUrl}/${req.params.token}/status`, {
+        // Check memory first for quick response
+        if (completedPayments[token]) {
+            console.log("✅ Paiement trouvé en mémoire :", completedPayments[token].status);
+            return res.json({ 
+                success: true, 
+                data: completedPayments[token] 
+            });
+        }
+
+        // Query SenePay API: GET /checkout/sessions/{sessionToken}
+        const senePayStatusUrl = `https://api.sene-pay.com/api/v1/checkout/sessions/${token}`;
+        
+        const statusResponse = await axios.get(senePayStatusUrl, {
             headers: {
                 'X-Api-Key': SENEPAY_CONFIG.apiKey,
                 'X-Api-Secret': SENEPAY_CONFIG.apiSecret
             }
         });
-        res.json({ success: true, data: response.data.data || response.data });
+
+        console.log("📦 Réponse SenePay:", statusResponse.data);
+
+        const sessionData = statusResponse.data.data || statusResponse.data;
+        const status = sessionData.status;
+
+        // Update memory with latest status
+        if (completedPayments[token]) {
+            completedPayments[token].status = status;
+        }
+
+        res.json({ 
+            success: true, 
+            data: {
+                status: status,
+                sessionToken: token,
+                ...sessionData
+            }
+        });
+
     } catch (error) {
-        res.status(500).json({ success: false });
+        console.log("❌ Erreur vérification statut");
+        if (error.response) {
+            console.log("🔴 Erreur API :", error.response.status, error.response.data);
+            res.status(error.response.status).json({ 
+                success: false, 
+                error: error.response.data 
+            });
+        } else {
+            console.log("🔴 Erreur :", error.message);
+            res.status(500).json({ 
+                success: false, 
+                message: error.message 
+            });
+        }
+    }
+});
+
+// Webhook to receive payment notifications from SenePay
+app.post('/api/webhook/senepay', (req, res) => {
+    console.log("\n🔔 WEBHOOK SENEPAY REÇU");
+    console.log("📦 Event :", req.body.event);
+    console.log("📦 Data :", JSON.stringify(req.body, null, 2));
+
+    const { event, sessionToken, status, amount } = req.body;
+
+    try {
+        if (!sessionToken) {
+            console.log("⚠️ Pas de sessionToken dans webhook");
+            return res.status(400).json({ error: "Missing sessionToken" });
+        }
+
+        // Handle different event types
+        switch(event) {
+            case 'checkout.session.completed':
+                console.log("✅ PAIEMENT RÉUSSI !");
+                completedPayments[sessionToken] = {
+                    status: 'Completed',
+                    amount: amount,
+                    completedAt: new Date().toISOString(),
+                    webhookReceived: true
+                };
+                break;
+
+            case 'checkout.session.failed':
+                console.log("❌ PAIEMENT ÉCHOUÉ");
+                completedPayments[sessionToken] = {
+                    status: 'Failed',
+                    amount: amount,
+                    failedAt: new Date().toISOString()
+                };
+                break;
+
+            case 'checkout.session.expired':
+                console.log("⏰ PAIEMENT EXPIRÉ");
+                completedPayments[sessionToken] = {
+                    status: 'Expired',
+                    amount: amount,
+                    expiredAt: new Date().toISOString()
+                };
+                break;
+
+            default:
+                console.log("ℹ️ Événement ignoré :", event);
+        }
+
+        // Always return 200 OK to acknowledge webhook receipt
+        res.json({ success: true, received: true });
+
+    } catch (error) {
+        console.log("❌ Erreur webhook :", error.message);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
     }
 });
 
