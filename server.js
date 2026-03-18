@@ -66,16 +66,29 @@ app.post('/api/initiate', async (req, res) => {
             }
         });
 
-        console.log("📦 Réponse brute SenePay:", response.data);
+        console.log("📦 Réponse brute SenePay:", JSON.stringify(response.data, null, 2));
 
         const responseData = response.data;
-        const sessionToken = responseData.sessionToken || responseData.data?.sessionToken;
-        const checkoutUrl = responseData.checkoutUrl || responseData.data?.checkoutUrl;
+        
+        // Try multiple paths for sessionToken - SenePay API might return it differently
+        let sessionToken = responseData.sessionToken || 
+                          responseData.data?.sessionToken || 
+                          responseData.id || 
+                          responseData.reference;
+        
+        // Try multiple paths for checkoutUrl
+        let checkoutUrl = responseData.checkoutUrl || 
+                         responseData.data?.checkoutUrl || 
+                         responseData.redirectUrl ||
+                         responseData.data?.redirectUrl;
+
+        console.log("🔍 Extraction token:", { sessionToken, checkoutUrl });
 
         if (checkoutUrl && sessionToken) {
             console.log("✅ SUCCÈS !");
             console.log("🔗 Lien paiement :", checkoutUrl);
             console.log("🎫 Token session :", sessionToken);
+            console.log("📝 Type de token utilisé:", typeof sessionToken, sessionToken.length);
             
             // Store payment in memory for webhook verification
             completedPayments[sessionToken] = {
@@ -96,10 +109,11 @@ app.post('/api/initiate', async (req, res) => {
             });
         } else {
             console.log("⚠️ Réponse incomplète - missing URL ou token");
-            console.log("Response keys:", Object.keys(responseData));
+            console.log("🔍 Response keys:", Object.keys(responseData));
+            console.log("🔍 Response.data keys:", Object.keys(responseData.data || {}));
             res.status(500).json({ 
                 success: false, 
-                message: "Réponse SenePay incomplète",
+                message: "Réponse SenePay incomplète - token ou URL manquant",
                 received: responseData 
             });
         }
@@ -248,4 +262,15 @@ app.post('/api/webhook/senepay', (req, res) => {
 const PORT = 3000;
 app.listen(PORT, () => {
     console.log(`\n✅ SERVEUR PRÊT SUR http://localhost:${PORT}`);
+    console.log("🔔 En attente de requêtes...\n");
+});
+
+// Gestionnaire pour les erreurs non capturées
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ Erreur Reject non gérée :', reason);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('❌ Exception non capturée :', error);
+    // Redémarrage optionnel: process.exit(1);
 });
